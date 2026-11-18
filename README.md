@@ -1,13 +1,19 @@
-# XNet for Horizon — slice 1: the item channel
+# XNet — a Horizon port
 
-A Horizon port of [XNet](https://github.com/McJtyMods/XNet) 1.21-7.0.7 by McJty (MIT): a
-controller, connectors and cables that move items between inventories on a channel.
+**XNet** is a Minecraft mod. Advanced item/liquid/energy/... networking. This repository is a **port of it to [Horizon](https://github.com/horizon-rust/horizon)**, the Rust engine for Minecraft Java 26.3. It carries the complete source of the port plus the content files it ships, and installs as a single `.hmod` package.
 
-One file installs both halves: **`xnet.hmod`** is the SDK package — the blocks, items, models,
-textures, lang, recipes and loot under `assets/` and `data/`, and the Rust that runs them in
-`src/`, compiled by the launcher against the pinned game build.
+Upstream: [McJtyMods/XNet](https://github.com/McJtyMods/XNet) — licence **MIT**.
 
-## What this slice does
+| | |
+|---|---|
+| Upstream mod | XNet ([source](https://github.com/McJtyMods/XNet)) |
+| Ported to | Horizon 0b14f8a, Minecraft Java 26.3, mod API `0.2` |
+| Package | `xnet.hmod` (install it with the Horizon launcher) |
+| Licence | **MIT** — the upstream mod's licence; see [Licence and credit](#licence-and-credit) |
+
+## What this port implements
+
+### What this slice does
 
 - **`xnet:controller`** — the network's controller. Eight channels; each is `none` or `item` and
   holds connector sides with a mode, a tick interval, a priority and a filter.
@@ -21,37 +27,47 @@ textures, lang, recipes and loot under `assets/` and `data/`, and the Rust that 
   connector's channels; `/xnet channel|connector|remove|speed|priority|filter|unfilter|blacklist`
   edit a channel (operator level 2), standing in for the controller screen.
 
-## What it does not do yet
+## Not yet ported
 
-Energy, fluid and logic channels (and the controller's RF cost); the advanced connector; the
-controller and connector screens; the other four cable colours, routers, wireless routers,
-antennas, facades and the redstone proxy; stack/count modes, random/ordered extraction, round-robin
-channels, the tag/meta/component filter toggles and the redstone gates. The full list, with the
-reason for each, is in [`notes.md`](notes.md#slice-boundary-and-gaps).
+- **A block entity cannot be ticked from outside, and a write inside its tick is reverted** → the
+- **No network/graph helper** (ARCHITECTURE.md §3) → the port walks its own adjacency, as
+- **No helper to move a stack atomically** → `native_move_items` moves one item at a time and puts
+- **Energy, fluid and logic channels**, and the controller's RF cost with them (the `block_entity_energy`
+- **The advanced connector** (faster interval list from 5 ticks, 500,000 FE).
+- **The controller and connector screens**, including the channel copy/paste and the filter slots.
+- **The other four cable colours** and the routing colour with routers and wireless routers.
+- **Antennas, facades and the redstone proxy** (the jar's `antenna`, `antenna_base`,
 
-## Building and testing
+## Installing
 
-The package pins SDK nightly `0b14f8acfd97fa2c750e42795249dcc981178ca4` and horizon-mixins
-`e59da9094f0c2fdda6c627fe9eff22dec6a906f0` (`horizon-mod.toml`). From this directory, with
-`CARGO_INCREMENTAL=0` and no `--target-dir`:
+1. Install the [Horizon launcher](https://github.com/horizon-rust/horizon/releases) (0.2.70 or newer).
+2. Add `xnet.hmod` to the instance's mods.
+3. The package is pinned to a specific Horizon build; the launcher checks that pin.
 
-```sh
-cargo test                                   # the pure runtime: 10 tests, no game needed
-cargo clippy --all-targets -- -D warnings
-rustfmt --check --config skip_children=true --edition 2024 src/lib.rs src/network.rs
+## Licence and credit
 
-rm -f Cargo.lock                             # never package a lock (it changes the artifact)
-cargo horizon-mod build                      # -> target/horizon-mod/xnet.hmod
-cp target/horizon-mod/xnet.hmod ./xnet.hmod
-cargo horizon-mod check xnet.hmod            # the registry's own check
-cargo horizon-mod fits xnet.hmod --build nightly
+XNet was created by its upstream authors; the code, models and assets in the original mod
+remain theirs and are used here under **MIT**. The Rust in this repository is a clean-room
+rewrite for Horizon, not a translation of the original source.
+
+- `LICENSE` — the upstream licence text.
+- `LICENSE-NOTICE.md` — what this port carries and where it came from.
+- The upstream project: https://github.com/McJtyMods/XNet
+
+## Technical details
+
+```
+horizon-mod.toml   package manifest (id, version, api, [native] pin)
+Cargo.toml         the crate; depends on `horizon-mod-api` from the fetched SDK
+src/               lib.rs (the one `impl Hooks`), runtime.rs (pure logic + tests), glue
+assets/ data/      the content the package ships
+tools/             content generators and the e2e scenario
 ```
 
-The in-game scenario is [`tools/e2e.sh`](tools/e2e.sh); it needs a launcher-built game
-(`GAME=<horizon-client>`) because a native package is compiled into the client by the launcher.
+- Build: `cargo horizon-mod build` (packages; it does not compile against the game).
+- Test: `cargo test`, `cargo clippy --all-targets -- -D warnings`.
+- In-game: `ports/tools/launcher-game.sh run xnet` in the campaign tree, or install the
+  `.hmod` and play; the harness scenario is `tools/e2e.sh`.
 
-## Licence
-
-MIT, as upstream. The upstream copyright and licence travel in [`LICENSE`](LICENSE) and
-[`LICENSE-NOTICE.md`](LICENSE-NOTICE.md), and inside the `.hmod`. Local-only until the maintainer
-approves publishing.
+This repository is generated from the campaign's port at `ports/xnet/`; the port's own
+`notes.md` is the full record (decisions, traps, evidence).
