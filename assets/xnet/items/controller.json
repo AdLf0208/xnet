@@ -1,0 +1,6 @@
+{
+  "model": {
+    "model": "xnet:block/controller",
+    "type": "minecraft:model"
+  }
+}

@@ -1,0 +1,9 @@
+{
+  "block.xnet.connector": "Connector",
+  "block.xnet.controller": "Controller",
+  "block.xnet.netcable": "Network Cable",
+  "item.xnet.connector_blue": "Blue Connector",
+  "item.xnet.controller": "Controller",
+  "item.xnet.netcable_blue": "Blue Network Cable",
+  "itemGroup.xnet": "XNet"
+}

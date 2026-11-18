@@ -1,0 +1,11 @@
+{
+  "item": true,
+  "properties": {
+    "hardness": 2.0,
+    "occludes": true,
+    "render_shape": "MODEL",
+    "requires_tool": true,
+    "sounds": "minecraft:stone"
+  },
+  "template": "minecraft:iron_block"
+}

@@ -1,0 +1,25 @@
+id = "xnet"
+name = "XNet"
+version = "0.2.0"
+description = """A port of XNet for Horizon: a controller owns eight channels, a channel holds
+connector/side entries whose settings say insert or extract, and the item channel hands one item
+per operation from the inventory behind an extractor to the inventory behind an inserter, highest
+priority first. The controller, the cable, the connector, their assets and the channel logic are
+one package, so a single .hmod installs both halves."""
+authors = ["McJty", "AdLf0208"]
+# A native mod: Rust in src/, compiled by the launcher against the game build [native] pins,
+# beside data/ and assets/. The id is the resource namespace and the only identity: Cargo's
+# package name and version are not the mod's.
+api = "0.2"
+# "both" is the installation side, not the hook's: a controller is placed and ticked by an
+# integrated server, which belongs to the client installation.
+side = "both"
+# The one shared value every manifest carries ("May add blocks, items, mob effects and entity
+# types"); this mod does add two blocks, two items and a block entity type, and the manifest's
+# shape is not negotiable.
+capabilities = ["registries"]
+
+[native]
+game = "26.3"
+horizon = "0b14f8acfd97fa2c750e42795249dcc981178ca4"
+mixins = "e59da9094f0c2fdda6c627fe9eff22dec6a906f0"

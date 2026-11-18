@@ -1,0 +1,41 @@
+{
+  "elements": [
+    {
+      "faces": {
+        "down": {
+          "texture": "xnet:block/connector_side"
+        },
+        "east": {
+          "texture": "xnet:block/connector_side"
+        },
+        "north": {
+          "texture": "xnet:block/connector_side"
+        },
+        "south": {
+          "texture": "xnet:block/connector_side"
+        },
+        "up": {
+          "texture": "xnet:block/connector_side"
+        },
+        "west": {
+          "texture": "xnet:block/connector_side"
+        }
+      },
+      "from": [
+        5,
+        5,
+        5
+      ],
+      "to": [
+        11,
+        11,
+        11
+      ]
+    }
+  ],
+  "parent": "minecraft:block/block",
+  "textures": {
+    "particle": "xnet:block/connector_side",
+    "texture": "xnet:block/connector_side"
+  }
+}

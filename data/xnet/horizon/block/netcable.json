@@ -1,0 +1,12 @@
+{
+  "connects_to": "#xnet:cable_connects",
+  "item": false,
+  "properties": {
+    "hardness": 1.0,
+    "occludes": false,
+    "render_shape": "MODEL",
+    "sounds": "minecraft:iron_block"
+  },
+  "template": "minecraft:chorus_plant",
+  "thickness": 4
+}

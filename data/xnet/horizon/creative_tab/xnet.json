@@ -1,0 +1,9 @@
+{
+  "icon": "xnet:controller",
+  "items": [
+    "xnet:controller",
+    "xnet:netcable_blue",
+    "xnet:connector_blue"
+  ],
+  "title": "itemGroup.xnet"
+}

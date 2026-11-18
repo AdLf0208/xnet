@@ -1,0 +1,7 @@
+{
+  "values": [
+    "xnet:controller",
+    "xnet:netcable",
+    "xnet:connector"
+  ]
+}

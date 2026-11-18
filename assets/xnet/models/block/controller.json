@@ -1,0 +1,12 @@
+{
+  "parent": "minecraft:block/cube",
+  "textures": {
+    "down": "xnet:block/machine_bottom",
+    "east": "xnet:block/machine_side",
+    "north": "xnet:block/machine_controller",
+    "particle": "xnet:block/machine_controller",
+    "south": "xnet:block/machine_side",
+    "up": "xnet:block/machine_top",
+    "west": "xnet:block/machine_side"
+  }
+}
