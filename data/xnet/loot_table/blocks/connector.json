@@ -6,7 +6,7 @@
       },
       "entries": [
         {
-          "name": "xnet:connector",
+          "name": "xnet:connector_blue",
           "type": "minecraft:item"
         }
       ],

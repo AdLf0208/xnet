@@ -1,5 +1,8 @@
 # XNet → Horizon — slice 1: the item channel
 
+> **Current package: 0.2.2** — slice 2, the item channel's amount and destination policy; see
+> [`## Slice 2`](#slice-2--the-item-channels-amount-and-destination-policy-022) at the end.
+>
 > **Format: the SDK package (2026-11-18), version 0.2.0.** This port was migrated from the
 > retired `.hnmod` container to one flat `.hmod` (content and code together) after Horizon's
 > mod-API merge; see [`## Migration to the SDK format`](#migration-to-the-sdk-format) at the end
@@ -443,3 +446,245 @@ That is the fail-capable set this slice needs: **with** the one `.hnmod` install
 `--dev-mod` the blocks, the items and the transfer all work; **without** the embedded file (write
 impossible) both ids are unknown; and `SELFTEST=1` flips the rate assertion so the same scenario
 fails with a `FAIL:` verdict and `EXIT:1`.
+
+## Review fixes (2026-11-18 review, rebuilt 2026-11-19 at 0.2.1)
+
+Skills: superpowers/using-superpowers, systematic-debugging, test-driven-development, verification-before-completion; BeautifulRust/rust-best-practices, rust-port
+
+**Findings and fixes** (`src/network.rs`):
+
+1. **202 — unbounded, repeated cable walk.** `runtime::walk_network(start, budget, is_wire)` walks
+   with a `BTreeSet` and stops at `MAX_NETWORK_VISITS = 4_096`; `run_controllers` reads the
+   controller's channels **first** and skips a controller with no non-empty item channel, so a
+   controller with nothing to transfer never walks its net.
+2. **266 — stale destination.** `run_operation` re-checks `on_network(network, target.connector)` for
+   every destination at transfer time (and `run_channel` for the source), so a saved connector whose
+   cable was removed receives nothing.
+3. **546 — remote diagnostics.** `runtime::diagnostics_permitted(permission, distance)` gates
+   `/xnet info` (operator level 2 or the console anywhere, everyone else within `DIAGNOSTIC_REACH` = 6
+   blocks), so a network's positions and filter settings are not readable from across the world.
+4. **68 — controller positions accumulate.** `runtime::prune_known` drops positions whose block is no
+   longer a controller and caps the set at `MAX_KNOWN_CONTROLLERS = 256`; `known_controllers` (the
+   readout's only consumer) prunes while it reads.
+
+**Tests.** `runtime::tests::{the_cable_walk_stops_at_its_budget,
+a_destination_counts_only_while_it_is_on_the_network, the_known_controller_set_is_pruned_and_capped,
+a_remote_diagnostic_needs_reach_or_permission}` — each was run against a stub of the old behaviour
+(unbounded walk, always-on-network, no prune, always-allowed) and failed there.
+
+**A harness-facing defect the in-game leg found (fixed here).** `<item:word>` cannot carry
+`minecraft:dirt` (a `word` ends at `:`), so `/xnet filter`/`unfilter` never parsed; both now take
+`<item:text>` (the usage's last argument). A3 (the filter phase) fails before this change and passes
+after it.
+
+**Ladder (0.2.1).** `cargo test` 14 passed · clippy `-D warnings` exit 0 · `fmt --check` exit 0 · two
+builds byte-identical · `check` exit 0 (`xnet 0.2.1 …`) · `fits --build 0b14f8a` exit 0.
+
+**In game.** `launcher-game.sh run xnet` → `PASS` + `E2E EXIT:0` (A–E, including the filter phase and
+the one-package check); control → `FAIL: the connector … did not register` + `EXIT:1`. Evidence:
+`ports/_shared/evidence/xnet-e2e/`.
+
+**Package.** `xnet.hmod` **60,761 B**, sha256
+`f0522c24886eef6fe18f3288b288fecf582be08815a41ef5f3e0719b8e6d341d`.
+
+## Slice 2 — the item channel's amount and destination policy (0.2.2)
+
+*The gap this closes*, quoted from [`## Slice boundary and gaps`](#slice-boundary-and-gaps) item 6:
+
+> **`StackMode.STACK`/`COUNT`, `extractAmount`, `count` (stock keeping), `ExtractMode.RANDOM`/`ORDER`,
+> `ROUNDROBIN` channel mode**, the tag/meta/component filter toggles and the redstone gates.
+
+The slice takes the **amount one operation carries** (`StackMode.SINGLE`/`STACK`/`COUNT` with
+`extractAmount`), the **stock-keeping `count`** on either end, and the **destination policy**
+(`ChannelMode.PRIORITY`/`ROUNDROBIN`). The extract-mode slot cursor (`FIRST`/`RND`/`ORDER`), the
+tag/meta/component filter toggles and the redstone gates stay gaps — the first needs a saved
+per-connector slot cursor, which a block-entity write inside the tick loses at this pin.
+
+**Why the `machines` tier fits it.** It is the item channel's own tick and its saved settings: no
+block, item, model or menu is added, and the whole slice is the rules the existing controller,
+cable and connector already run. Upstream's `ItemChannelSettings.tickItemHandler`, `insertStack`
+and `fetchItem`, and `ItemConnectorSettings`' fields, are the behaviour; the parity legs add no
+family the jar does not have.
+
+**Pin.** Horizon `0a875da91dbb0fdcb7ba8c42c11341aa229af51a` + mixins
+`e59da9094f0c2fdda6c627fe9eff22dec6a906f0` (Nightly 2026-11-20). `cargo horizon-mod update
+--horizon 0a875da` reported **"none of the 261 items it uses changed"**, so the repin itself is
+behaviour-free; the package's `[native]` block now names it.
+
+### The rules, and where they come from
+
+| Rule | Upstream | Here |
+|---|---|---|
+| `StackMode.SINGLE` | `fetchItem` s = 1 | one item per operation (0.2.1's behaviour) |
+| `StackMode.STACK` | s = `stack.getMaxStackSize()`, capped by `fetchItem`'s `maxamount = 64` | `take_amount` = 64, capped by the slot |
+| `StackMode.COUNT` | s = `extractAmount`, null → 1 | `extract_amount`, stored 1..=64 (`OPERATION_CAPACITY`) |
+| extractor `count` | `tickItemHandler`: `countItems(handler, matcher)` must reach `count`, and only `amount - count` leaves | `take_amount` = min(wanted, slot, matching − count) |
+| inserter `count` | `insertStack`: `toinsert = min(total, count - countItems(destination, matcher))` | `accept_amount` = min(amount, count − matching) |
+| the count's matcher | `countItems` counts what `getMatcher` accepts; an empty filter accepts everything | `count_matching` counts what the settings' filter accepts (so a `count` with no filter limits the whole container, as upstream) |
+| `ChannelMode.PRIORITY` | `insertStack` sets `roundRobinOffset = 0` | `destination_plan` ignores the offset |
+| `ChannelMode.ROUNDROBIN` | offset advances once per destination that accepted an item | `next_offset` after the operation; the offset is session state, as upstream's field is in memory |
+
+The saved entry string gained three fields after the priority (`stack`, `amount`, `count`, `-` for
+none); `ItemSettings::load` recognises them by the fifth field naming a stack mode, so a 0.2.1 save
+loads with the defaults instead of losing its connector settings. The channel's mode is a third
+block-entity key (`chN.mode`), written by the same merge that writes the entries.
+
+Commands (the controller screen is still a gap): `/xnet stack <pos> <ch> <conn> <side>
+<single|stack|count>`, `/xnet amount … <1..64>`, `/xnet count … <n|->`, `/xnet mode <pos> <ch>
+<priority|roundrobin>`. The readout appends the mode and the count: `…, priority 0, filter all,
+single`, `…, count`, `…, single, keep 5`, `…, single, stock 5`. The channel line now ends with its
+distribution mode (`channel 0 item, 3 connector(s), roundrobin`).
+
+### Red → green
+
+The four tests were written first and run against a stub that reproduced 0.2.1's behaviour (one
+item per operation, no count, no rotation, the old save format), so the red is a behavioural
+failure, not a missing symbol — `ports/_shared/evidence/xnet/slice2-test-red.log`:
+
+```
+test runtime::tests::a_stack_mode_says_how_much_one_operation_carries ... FAILED
+test runtime::tests::the_stock_count_limits_both_ends ... FAILED
+test runtime::tests::roundrobin_rotates_the_destination_order ... FAILED
+test runtime::tests::the_amount_settings_round_trip_and_old_saves_still_load ... FAILED
+---- a_stack_mode_says_how_much_one_operation_carries ----
+panicked at src/runtime.rs:1109: assertion `left == right` failed
+  left: 1
+ right: 64
+---- the_stock_count_limits_both_ends ----
+panicked at src/runtime.rs:1149: assertion `left == right` failed
+  left: 1
+ right: 15
+---- roundrobin_rotates_the_destination_order ----
+panicked at src/runtime.rs:1220: assertion `left == right` failed
+  left: [1, 2, 3]
+ right: [2, 3, 1]
+---- the_amount_settings_round_trip_and_old_saves_still_load ----
+panicked at src/runtime.rs:1279: assertion `left == right` failed
+  left:  Some(ItemSettings { …, filter minecraft:stone, stack_mode: Single, extract_amount: 1, count: None })
+ right: Some(ItemSettings { …, filter minecraft:stone, stack_mode: Stack, extract_amount: 1, count: Some(5) })
+test result: FAILED. 14 passed; 4 failed
+```
+
+Green: `18 passed; 0 failed` (`slice2-test.log`). The glue's new pieces are `count_matching`
+(upstream's `countItems`), `move_up_to` (one transaction per operation: extract, insert across the
+plan's destinations as far as each accepts, put back what did not arrive) and the per-level,
+per-channel round-robin offsets in `Controllers` (pruned with the known-controller set).
+
+### Ladder (0.2.2)
+
+| Step | Command (through `build-slot.sh run --step …`) | Result |
+|---|---|---|
+| runtime RED | `cargo test` against the stub | 14 passed, **4 failed** — `slice2-test-red.log` |
+| runtime GREEN | `cargo test` | **18 passed**, 0 failed — `slice2-test.log`, `sdk-test.log` |
+| lints | `cargo clippy --all-targets -- -D warnings` | exit 0, 0 warnings — `slice2-clippy.log` |
+| formatting | `rustfmt --check --config skip_children=true --edition 2024 src/{lib,network,runtime}.rs` | `fmt_exit=0` — `slice2-fmt.log` (trap 27: `cargo fmt` follows `mod`s) |
+| package | `rm -f Cargo.lock; cargo horizon-mod build` ×2 | `target/horizon-mod/xnet.hmod`, **`cmp` byte-identical**, **67,820 B**, sha256 `305e8976…b67`, 53 entries, no packed `Cargo.lock` — `slice2-build.log` |
+| check | `cargo horizon-mod check xnet.hmod` | `xnet 0.2.2 (native-mod, format native-1/0a875da…/e59da909…, for 26.3)`, **67,820 B**, sha256 `305e8976…b67`, exit 0 — `slice2-check.log` |
+| fits the pin | `cargo horizon-mod fits xnet.hmod --build 0a875da` | `0a875da  made for` |
+| fits another build | `cargo horizon-mod fits xnet.hmod --build 0b14f8a` | `0b14f8a  fits` — `slice2-fits.log` |
+| package audit | `python3 ports/tools/verify-sdk-package.py xnet` | **1/1** (package, runtime byte-identical, no `Cargo.lock`, 18 tests, 0 clippy warnings, check, fits, skills gate) |
+| in game | `launcher-game.sh run xnet` (offscreen) | **PASS + `EXIT:0`** — `evidence/xnet-e2e/e2e-slice2.log` |
+| control | `GAME=$CONTROL_GAME tools/e2e.sh` | `FAIL: the connector at 1,100,0 did not register: minecraft:air`, `EXIT:1` — `e2e-slice2-control.log` |
+| selftest (A) | `SELFTEST=1` | `FAIL: SELFTEST: the channel moved 16 stone in 160 ticks…`, `EXIT:1` — `e2e-slice2-selftest.log` |
+| selftest (slice 2) | `SELFTEST=amount` (F1 with the stack mode left at single) | `FAIL: one operation moved 2 of 20 items, not the whole slot`, `EXIT:1` — `e2e-slice2-selftest-amount.log` |
+| log audit | `python3 ports/tools/check-e2e-logs.py xnet-e2e --strict` | `logs=6 ok=6 missing-exit=0 bad-exit=0`, exit 0 |
+| skills gate | `python3 ports/tools/check-skills.py --notes ports/xnet` | `Skills line present`, PASS |
+
+### In game (quoted from `e2e-slice2.log`)
+
+```
+== F: how much one operation carries, and where it goes ==
+== F1: stack mode moves the whole slot in one operation ==
+  XNet controller at 37,100,1: channel 0 37,100,0 west extract, 64 items every 200 ticks, priority 0, filter all, stack
+  one operation at 200 ticks moved 20 of 20 (single would move 1)
+== F2: count mode takes the configured amount per operation ==
+  XNet controller at 37,100,1: channel 0 37,100,0 west extract, 16 items every 10 ticks, priority 0, filter all, count
+  100 ticks at 16 an operation moved 160 (single would be about 10)
+== F3: a stock count caps the destination ==
+  XNet controller at 37,100,1: channel 0 40,100,0 east insert, 1 item every 10 ticks, priority 0, filter all, single, stock 5
+  stock 5 over 200 ticks: target 5, source 15
+== F4: a count on the extractor keeps items in the source ==
+  XNet controller at 37,100,1: channel 0 37,100,0 west extract, 1 item every 10 ticks, priority 0, filter all, single, keep 5
+  keep 5 over 200 ticks: source 5, target 15
+== F5: round robin uses both inserters; priority fills one ==
+  XNet controller at 37,100,1: channel 0 item, 3 connector(s), roundrobin
+  round robin: east 10, south 10
+  XNet controller at 37,100,1: channel 0 item, 3 connector(s), priority
+  priority: east 0, south 20
+== F6: an unknown stack mode is refused and changes nothing ==
+== D: the channel, its sides and its interval survive a relaunch ==
+  XNet controller at 37,100,1: channel 0 item, 3 connector(s), roundrobin
+  XNet controller at 37,100,1: channel 0 37,100,0 west extract, 16 items every 10 ticks, priority 0, filter all, count
+  after the relaunch the count-mode channel moved 4 (expected 4)
+```
+
+Each assertion can fail, and each has its pair: the whole default leg is the differential for the
+control leg (a game without the package cannot register the connector), `SELFTEST=amount` is F1's
+counterfactual (the same phase with the stack mode left at `single` moves 2, not 20), and F5's
+priority half is the differential *inside* the passing run (the same three inserters, the same
+20 items, all to one destination).
+
+### Upstream defects fixed
+
+The parity legs found three carried artefacts that could never work at this pin. Each was proved
+from the game's own log, fixed minimally, and is proved by an in-game assertion:
+
+1. **The recipes were in the vanilla ingredient form, which this pin does not parse.** The server
+   logged `recipes: invalid ingredient (unresolved tag or malformed input): {"item":"minecraft:redstone"}`
+   for every key of all three files: the pin's `Ingredient::parse` reads a string (`"minecraft:x"`)
+   or `"#tag"`, not the 1.21.1 `{ "item": … }` / `{ "tag": … }` objects. Fixed by writing the three
+   files in the pin's compact form; the declared patterns, keys and results are unchanged.
+   A user would notice nothing but a recipe that never appeared in the recipe book.
+2. **The `netcable` and `connector` loot tables dropped a block id that has no item** (`"item": false`
+   on both blocks, as upstream declares), so breaking a cable dropped nothing. Fixed to drop
+   `xnet:netcable_blue` and `xnet:connector_blue` — upstream's table drops the item of the block's
+   colour, and this slice has one colour.
+3. **The recipes name `c:` convention tags, which no mod at this pin declares** (`c:dyes/blue`,
+   `c:chests`, `c:ingots/gold`, `c:nuggets/gold`), so even in the right form they could not match.
+   Under NeoForge the loader supplies them. Fixed by declaring the four tags in this package with
+   their vanilla members, which also makes them readable by other mods (the ruling's "declare it,
+   so the ecosystem finds it under either name"). `c:chests` carries the chest, trapped chest and
+   barrel; the game proves the tag is read, not one item: the connector crafts with either chest and
+   not with stone.
+
+### Coverage (the parity rule, 2026-11-20)
+
+| Family | State |
+|---|---|
+| `xnet:controller` block + item | `tested` (P: give, place, loot; the readout in A/F) |
+| `xnet:netcable`, `xnet:connector` blocks | `tested` (A/B/C setblock and read-back; P: both refuse an item id, as their files declare; loot drops the blue item) |
+| `xnet:netcable_blue`, `xnet:connector_blue` items | `tested` (P: give and read back, craft, loot) — **they do not place their block**: `blocked(no block-item link for a content item at this pin; upstream's colour item is a BaseBlockItem)`, next slice |
+| recipe `netcable_blue` (16) | `tested` (P: crafted, id + count + string and gold nugget consumed; red dye control) |
+| recipe `connector_blue` (1) | `tested` (P: crafted with a chest and with a trapped chest, chest consumed; stone and red-dye controls) |
+| recipe `controller` | `blocked(rftoolsbase:machine_frame)` — the control proves it crafts nothing without its parent |
+| loot tables (`netcable`, `connector`, `controller`) | `tested` (P: `loot give` each, the declared item arrives) |
+| tags `xnet:cables`, `xnet:connectors` | `tested` (P: `execute if items … #tag` with a dirt negative) |
+| tag `minecraft:mineable/pickaxe` | `tested` (P: the placed controller matches, dirt does not) |
+| tags `c:dyes/blue`, `c:chests`, `c:ingots/gold`, `c:nuggets/gold` | `tested` via the recipes (a member matches, a non-member does not) |
+| commands `/xnet info`, `channel`, `connector`, `remove`, `speed`, `priority`, `filter`, `unfilter`, `blacklist` | `tested` (A, A2, A3, C2, D) |
+| commands `/xnet stack`, `amount`, `count`, `mode` | `tested` (F1–F6) |
+| item channel: rate, filter, priority | `tested` (A, A2, A3, C2) |
+| item channel: stack mode, count mode, stock/keep, round robin | `tested` (F1–F5, D) |
+| item channel persistence | `tested` (D) |
+| energy / fluid / logic channels, the controller's RF cost | `not ported` (gap 1) |
+| advanced connector | `not ported` (gap 2) |
+| controller and connector screens | `not ported` (gap 3) |
+| the other four cable colours, routers, wireless routers | `not ported` (gap 4) |
+| antennas, facades, redstone proxy | `not ported` (gap 5) |
+| `ExtractMode.RND`/`ORDER`, the tag/meta/component filter toggles, redstone gates | `not ported` (gap 6, the rest of it) |
+| recipe unlock advancements | `not ported` (gap 7) |
+
+### Limits this slice adds
+
+- A round-robin offset lives in the port's session state, not in the controller's block entity (a
+  write inside the tick is reverted at this pin). It restarts at the first destination when the
+  world loads or the channel's kind/mode changes, which is what upstream's in-memory field does.
+- `StackMode.STACK` takes up to 64, the operation cap; an item whose real max stack is 16 would be
+  taken as one 16-stack from the slot, which is what the container allows anyway.
+- `extract_amount` is stored 1..=64 (`fetchItem` caps at 64), so a `/xnet amount 100` behaves as 64
+  instead of being rejected.
+- The `count` is the matcher's total, and an empty filter matches everything: an inserter with
+  `stock 5` and no filter stocks the whole destination to five items of any kind, as upstream's
+  `countItems(destination, getMatcher())` does.
+
+Skills: superpowers/using-superpowers,brainstorming,writing-plans,test-driven-development,systematic-debugging,verification-before-completion; BeautifulRust/rust-best-practices

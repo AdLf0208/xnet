@@ -20,9 +20,11 @@ use mod_api::{
 };
 
 use crate::runtime::{
-    Channel, ChannelType, Controller, Entry, FACE_COUNT, FACE_NAMES, ItemSettings, MAX_CHANNELS,
-    Pos, SINGLE_AMOUNT, TransferMode, destination_order, face_named, is_operation_tick, opposite,
-    phase_of, step,
+    Channel, ChannelMode, ChannelType, Controller, Entry, FACE_COUNT, FACE_NAMES, ItemSettings,
+    MAX_CHANNELS, MAX_KNOWN_CONTROLLERS, MAX_NETWORK_VISITS, OPERATION_CAPACITY, Pos,
+    SINGLE_AMOUNT, StackMode, TransferMode, destination_plan, diagnostics_permitted, face_named,
+    is_operation_tick, next_offset, on_network, opposite, phase_of, prune_known, step,
+    walk_network,
 };
 
 /// The controller block (and its item).
@@ -59,6 +61,11 @@ fn keys(host: &dyn Host) -> Option<Keys> {
 pub(crate) struct Controllers {
     pending: HashMap<LevelRef, BTreeSet<Pos>>,
     known: HashMap<LevelRef, BTreeSet<Pos>>,
+    /// Each channel's round-robin offset, by controller and channel: session state,
+    /// as upstream keeps `roundRobinOffset` on the channel's settings object in
+    /// memory. A write into the block entity from the pass would be reverted at this
+    /// pin, and upstream's offset restarts at zero on load too.
+    offsets: HashMap<(LevelRef, Pos, usize), usize>,
 }
 
 impl Controllers {
@@ -73,12 +80,48 @@ impl Controllers {
         self.pending.remove(&level).unwrap_or_default()
     }
 
+    /// Channel `channel`'s round-robin offset for the controller at `pos`.
+    pub(crate) fn offset(&self, level: LevelRef, pos: Pos, channel: usize) -> usize {
+        self.offsets
+            .get(&(level, pos, channel))
+            .copied()
+            .unwrap_or(0)
+    }
+
+    /// Remember `offset` as channel `channel`'s round-robin offset.
+    pub(crate) fn remember_offset(
+        &mut self,
+        level: LevelRef,
+        pos: Pos,
+        channel: usize,
+        offset: usize,
+    ) {
+        self.offsets.insert((level, pos, channel), offset);
+    }
+
     /// Every controller of `level` seen so far, in position order.
     fn known(&self, level: LevelRef) -> Vec<Pos> {
         self.known
             .get(&level)
             .map(|positions| positions.iter().copied().collect())
             .unwrap_or_default()
+    }
+
+    /// Forget the controllers of `level` that no longer hold a controller block, and keep the
+    /// set at its cap: a player can place and remove controllers for a whole session, and the
+    /// readout's index is not a place for that history to live. Their round-robin offsets go
+    /// with them.
+    fn prune(&mut self, level: LevelRef, still_there: impl Fn(Pos) -> bool) {
+        if let Some(known) = self.known.get_mut(&level) {
+            prune_known(known, still_there, MAX_KNOWN_CONTROLLERS);
+            if known.is_empty() {
+                self.known.remove(&level);
+            }
+        }
+        let live = self.known.get(&level);
+        self.offsets.retain(|(offset_level, pos, _), _| {
+            *offset_level != level || live.is_some_and(|live| live.contains(pos))
+        });
     }
 }
 
@@ -127,9 +170,14 @@ fn level_in_place(host: &dyn ServerHost) -> Option<LevelRef> {
         .find(|&level| level.in_place(host))
 }
 
-/// The two keys one channel saves under: its kind, and its connector sides.
-fn channel_keys(index: usize) -> (String, String) {
-    (format!("ch{index}.type"), format!("ch{index}"))
+/// The three keys one channel saves under: its kind, its connector sides and its
+/// distribution mode.
+fn channel_keys(index: usize) -> (String, String, String) {
+    (
+        format!("ch{index}.type"),
+        format!("ch{index}"),
+        format!("ch{index}.mode"),
+    )
 }
 
 /// The string a compound holds under `name`, if it holds one.
@@ -145,7 +193,7 @@ fn text(nbt: &Compound, name: &str) -> Option<String> {
 fn read_controller(nbt: &Compound) -> Controller {
     let mut controller = Controller::new();
     for index in 0..MAX_CHANNELS {
-        let (type_key, entries_key) = channel_keys(index);
+        let (type_key, entries_key, mode_key) = channel_keys(index);
         let Some(kind) = text(nbt, &type_key).and_then(|name| ChannelType::named(&name)) else {
             continue;
         };
@@ -153,7 +201,10 @@ fn read_controller(nbt: &Compound) -> Controller {
             continue;
         }
         let saved = text(nbt, &entries_key).unwrap_or_default();
-        controller = controller.with_channel(index, Channel::load(kind, &saved));
+        let mode = text(nbt, &mode_key)
+            .and_then(|name| ChannelMode::named(&name))
+            .unwrap_or_default();
+        controller = controller.with_channel(index, Channel::load(kind, &saved).with_mode(mode));
     }
     controller
 }
@@ -164,12 +215,13 @@ fn read_controller(nbt: &Compound) -> Controller {
 fn controller_data(controller: &Controller) -> Compound {
     let mut data = Compound::new();
     for index in 0..MAX_CHANNELS {
-        let (type_key, entries_key) = channel_keys(index);
-        let (kind, saved) = match controller.channel(index) {
-            Some(channel) => (channel.kind(), channel.save()),
-            None => (ChannelType::None, String::new()),
+        let (type_key, entries_key, mode_key) = channel_keys(index);
+        let (kind, saved, mode) = match controller.channel(index) {
+            Some(channel) => (channel.kind(), channel.save(), channel.mode()),
+            None => (ChannelType::None, String::new(), ChannelMode::Priority),
         };
         data.insert(type_key.as_str().into(), Tag::String(kind.name().into()));
+        data.insert(mode_key.as_str().into(), Tag::String(mode.name().into()));
         if kind != ChannelType::None && !saved.is_empty() {
             data.insert(
                 entries_key.as_str().into(),
@@ -196,22 +248,14 @@ fn is_wire(host: &dyn Host, keys: &Keys, level: LevelRef, pos: Pos) -> bool {
     matches!(level.block(host, pos), Some(block) if block == keys.cable || block == keys.connector)
 }
 
-/// The contiguous run of cables and connectors `start` belongs to, in a stable
-/// order. One colour only in this slice, so adjacency is the whole rule
-/// upstream's `ChunkBlob.createCableSegment` applies to one colour.
+/// The contiguous run of cables and connectors `start` belongs to, in a stable order, read
+/// through [`walk_network`]'s visit budget. One colour only in this slice, so adjacency is the
+/// whole rule upstream's `ChunkBlob.createCableSegment` applies to one colour; the budget is
+/// what keeps a player-built net from turning one tick into a whole-server walk.
 fn network_of(host: &dyn Host, keys: &Keys, level: LevelRef, start: Pos) -> Vec<Pos> {
-    let mut seen: BTreeSet<Pos> = BTreeSet::new();
-    let mut queue = vec![start];
-    seen.insert(start);
-    while let Some(pos) = queue.pop() {
-        for face in 0..FACE_COUNT {
-            let beside = step(pos, face);
-            if is_wire(host, keys, level, beside) && seen.insert(beside) {
-                queue.push(beside);
-            }
-        }
-    }
-    seen.into_iter().collect()
+    walk_network(start, MAX_NETWORK_VISITS, |pos| {
+        is_wire(host, keys, level, pos)
+    })
 }
 
 /// The network a controller owns: the run through the connector it touches, or
@@ -233,20 +277,65 @@ fn controller_network(
     Some(network_of(host, keys, level, start))
 }
 
-/// Run one extractor's operation: the first matching stack in the inventory on
-/// its side, handed to the channel's inserters in priority order, one item
-/// (`StackMode.SINGLE`). An item no destination accepts stays where it is, and
-/// the next matching slot is tried, as upstream's `tickItemHandler` does.
-fn run_operation(host: &mut dyn ServerHost, level: LevelRef, entries: &[Entry], index: usize) {
-    let source = &entries[index];
+/// How many items a container holds that pass `settings`' filter (upstream's
+/// `countItems`, which a stock-keeping count reads). An empty filter matches
+/// everything, as `getMatcher` does, so a count with no filter limits the whole
+/// container.
+fn count_matching(
+    host: &mut dyn ServerHost,
+    container: &Capability<dyn ResourceHandler<ItemResource>>,
+    settings: &ItemSettings,
+) -> u32 {
+    let mut total: u32 = 0;
+    for slot in 0..container.size(host) {
+        let Some(resource) = container.resource(host, slot) else {
+            continue;
+        };
+        if settings.matches(&resource.item().id(host)) {
+            total = total.saturating_add(container.amount(host, slot));
+        }
+    }
+    total
+}
+
+/// One extractor's operation: the channel it belongs to, its connector sides, the
+/// controller's live network and the destination order this operation tries.
+struct Operation<'a> {
+    level: LevelRef,
+    network: &'a BTreeSet<Pos>,
+    entries: &'a [Entry],
+    plan: &'a [usize],
+}
+
+/// One channel of one controller, for this tick: where it lives, its network and the
+/// session state its round-robin offset is kept in.
+struct ChannelRun<'a> {
+    level: LevelRef,
+    network: &'a BTreeSet<Pos>,
+    controller: Pos,
+    index: usize,
+    controllers: &'a Mutex<Controllers>,
+    game_time: u64,
+}
+
+/// Run one extractor's operation: the first matching slot whose items a destination
+/// accepts, up to what the settings say one operation carries (`StackMode`), handed
+/// to the channel's inserters in the operation's plan order. An item no destination
+/// accepts stays where it is, and the next matching slot is tried, as upstream's
+/// `tickItemHandler` does. Returns how many destinations accepted something, which
+/// advances a round-robin channel's offset.
+fn run_operation(host: &mut dyn ServerHost, operation: &Operation<'_>, index: usize) -> usize {
+    let source = &operation.entries[index];
     let from = step(source.connector, source.side);
     let from_face = Direction::ALL[opposite(source.side)];
-    let order = destination_order(entries, source);
-    if order.is_empty() {
-        return;
+    if operation.plan.is_empty() {
+        return 0;
     }
-    let Some(source_container) = level.capability(host, &ITEMS, from, Some(from_face)) else {
-        return;
+    let Some(source_container) = operation
+        .level
+        .capability(host, &ITEMS, from, Some(from_face))
+    else {
+        return 0;
     };
     for slot in 0..source_container.size(host) {
         let Some(resource) = source_container.resource(host, slot) else {
@@ -258,82 +347,166 @@ fn run_operation(host: &mut dyn ServerHost, level: LevelRef, entries: &[Entry], 
         if !source.settings.matches(&item) {
             continue;
         }
-        for &destination in &order {
-            let target = &entries[destination];
-            if !target.settings.matches(&item) {
-                continue;
-            }
-            let to = step(target.connector, target.side);
-            let to_face = Direction::ALL[opposite(target.side)];
-            let Some(target_container) = level.capability(host, &ITEMS, to, Some(to_face)) else {
-                continue;
-            };
-            if move_one(host, &source_container, slot, &resource, &target_container) {
-                return;
-            }
+        // A stock-keeping count needs the whole source's total of this item, not
+        // just the slot's; with no count it is never read.
+        let matching_total = match source.settings.count() {
+            Some(_) => count_matching(host, &source_container, &source.settings),
+            None => 0,
+        };
+        let take = source
+            .settings
+            .take_amount(source_container.amount(host, slot), matching_total);
+        if take == 0 {
+            continue;
+        }
+        let used = move_up_to(
+            host,
+            operation,
+            &source_container,
+            slot,
+            &resource,
+            &item,
+            take,
+        );
+        if used > 0 {
+            return used;
         }
     }
+    0
 }
 
-/// One item from `slot` of `from` into `to`, in one transaction: `true` when it
-/// moved. A destination that refuses it leaves the item in its own slot, which
-/// is upstream's `ItemHandlerHelper.insertItem` contract; a source that cannot
-/// take it back aborts the transaction, so nothing leaves at all.
-fn move_one(
+/// Move up to `take` of `resource` from `slot` of `from` into the plan's destinations,
+/// in order, each as far as its own stock count allows; whatever no destination takes
+/// stays in its slot. One transaction, as upstream's `insertStack` plus its
+/// `fetchItem` correction leaves the source with only what was inserted. Returns how
+/// many destinations accepted an item.
+fn move_up_to(
     host: &mut dyn ServerHost,
+    operation: &Operation<'_>,
     from: &Capability<dyn ResourceHandler<ItemResource>>,
     slot: usize,
     resource: &ItemResource,
-    to: &Capability<dyn ResourceHandler<ItemResource>>,
-) -> bool {
+    item: &str,
+    take: u32,
+) -> usize {
+    // Where this operation may go, with each destination's room: resolved before the
+    // transaction, because a capability is a read of the level.
+    let mut targets: Vec<(Capability<dyn ResourceHandler<ItemResource>>, u32)> = Vec::new();
+    let mut unplaced = take;
+    for &destination in operation.plan {
+        if unplaced == 0 {
+            break;
+        }
+        let target = &operation.entries[destination];
+        // A saved connector is only a destination while it is still on the
+        // controller's live network: its cable or connector may be gone since the
+        // channel was saved (the review finding).
+        if !target.settings.matches(item) || !on_network(operation.network, target.connector) {
+            continue;
+        }
+        let to = step(target.connector, target.side);
+        let to_face = Direction::ALL[opposite(target.side)];
+        let Some(container) = operation.level.capability(host, &ITEMS, to, Some(to_face)) else {
+            continue;
+        };
+        let stocked = match target.settings.count() {
+            Some(_) => count_matching(host, &container, &target.settings),
+            None => 0,
+        };
+        let room = target.settings.accept_amount(unplaced, stocked);
+        if room == 0 {
+            continue;
+        }
+        unplaced -= room;
+        targets.push((container, room));
+    }
+    if targets.is_empty() {
+        return 0;
+    }
     host.transaction(|host, tx| {
-        let taken = from.extract(host, tx, slot, resource, SINGLE_AMOUNT);
+        let taken = from.extract(host, tx, slot, resource, take);
         if taken == 0 {
             return Err(());
         }
-        if to.insert_any(host, tx, resource, taken) == taken {
-            return Ok(true);
+        let mut inserted = 0;
+        let mut used = 0;
+        for (container, room) in &targets {
+            let allowed = (*room).min(taken - inserted);
+            if allowed == 0 {
+                continue;
+            }
+            let went = container.insert_any(host, tx, resource, allowed);
+            if went > 0 {
+                used += 1;
+            }
+            inserted += went;
+            if inserted >= taken {
+                break;
+            }
         }
-        if from.insert(host, tx, slot, resource, taken) == taken {
-            Ok(false)
-        } else {
-            Err(())
+        // Whatever did not arrive stays in its slot, as `ItemHandlerHelper.insertItem`'s
+        // contract leaves it; a source that cannot take it back aborts the transaction,
+        // so nothing leaves a container without arriving somewhere.
+        let keep = taken - inserted;
+        if keep > 0 && from.insert(host, tx, slot, resource, keep) != keep {
+            return Err(());
         }
+        Ok(used)
     })
-    .unwrap_or(false)
+    .unwrap_or(0)
 }
 
 /// Run every extractor of one channel that is due this tick and still on the
-/// controller's network.
-fn run_channel(
-    host: &mut dyn ServerHost,
-    level: LevelRef,
-    network: &[Pos],
-    channel: &Channel,
-    game_time: u64,
-) {
+/// controller's network, advancing the channel's round-robin offset as upstream's
+/// `insertStack` does.
+fn run_channel(host: &mut dyn ServerHost, run: &ChannelRun<'_>, channel: &Channel) {
     let entries = channel.entries();
     if channel.is_empty() {
         return;
     }
     for (index, entry) in entries.iter().enumerate() {
         if entry.settings.mode() != TransferMode::Extract
-            || !network.contains(&entry.connector)
+            || !on_network(run.network, entry.connector)
             || !is_operation_tick(
-                game_time,
+                run.game_time,
                 phase_of(entry.connector, entry.side),
                 u64::from(entry.settings.interval()),
             )
         {
             continue;
         }
-        run_operation(host, level, entries, index);
+        // Only this expression runs under the lock: one read of the port's own state.
+        let offset = run
+            .controllers
+            .lock()
+            .expect("the round-robin lock is held for one read")
+            .offset(run.level, run.controller, run.index);
+        let plan = destination_plan(entries, entry, channel.mode(), offset);
+        let operation = Operation {
+            level: run.level,
+            network: run.network,
+            entries,
+            plan: &plan,
+        };
+        let used = run_operation(host, &operation, index);
+        if used > 0 {
+            let next = next_offset(offset, plan.len(), used);
+            run.controllers
+                .lock()
+                .expect("the round-robin lock is held for one write")
+                .remember_offset(run.level, run.controller, run.index, next);
+        }
     }
 }
 
 /// After the level's tick: run every item channel of every controller queued
 /// this tick.
-pub(crate) fn run_controllers(host: &mut dyn ServerHost, level: LevelRef, queued: BTreeSet<Pos>) {
+pub(crate) fn run_controllers(
+    host: &mut dyn ServerHost,
+    level: LevelRef,
+    queued: BTreeSet<Pos>,
+    controllers: &Mutex<Controllers>,
+) {
     if queued.is_empty() {
         return;
     }
@@ -345,21 +518,38 @@ pub(crate) fn run_controllers(host: &mut dyn ServerHost, level: LevelRef, queued
     };
     let game_time = game_time.max(0) as u64;
     for controller_pos in queued {
-        let Some(network) = controller_network(host, &keys, level, controller_pos) else {
-            continue;
-        };
-        // Read the channels out before the transfer borrows the game mutably.
+        // Read the channels out before the transfer borrows the game mutably, and before the
+        // network walk: a controller with no item channel has no transfer to make, so its
+        // cable net is never read (the review finding).
         let Some(channels) = controller_at(host, &keys, level, controller_pos).map(|controller| {
             controller
                 .channels()
                 .filter(|(_, channel)| channel.kind() == ChannelType::Item)
-                .map(|(_, channel)| channel.clone())
-                .collect::<Vec<Channel>>()
+                .map(|(index, channel)| (index, channel.clone()))
+                .collect::<Vec<(usize, Channel)>>()
         }) else {
             continue;
         };
-        for channel in channels {
-            run_channel(host, level, &network, &channel, game_time);
+        if channels.iter().all(|(_, channel)| channel.is_empty()) {
+            continue;
+        }
+        let Some(network) = controller_network(host, &keys, level, controller_pos) else {
+            continue;
+        };
+        let network: BTreeSet<Pos> = network.into_iter().collect();
+        for (index, channel) in channels {
+            run_channel(
+                host,
+                &ChannelRun {
+                    level,
+                    network: &network,
+                    controller: controller_pos,
+                    index,
+                    controllers,
+                    game_time,
+                },
+                &channel,
+            );
         }
     }
 }
@@ -373,8 +563,34 @@ fn mode_word(mode: TransferMode) -> &'static str {
     }
 }
 
-/// A connector side's settings as one readout line: side, mode, rate, priority
-/// and filter.
+/// How much one operation carries, as the readout words it: `SINGLE` one item, `STACK`
+/// the whole slot up to the operation cap, `COUNT` the configured amount.
+fn amount_phrase(settings: &ItemSettings) -> String {
+    let amount = match settings.stack_mode() {
+        StackMode::Single => SINGLE_AMOUNT,
+        StackMode::Stack => OPERATION_CAPACITY,
+        StackMode::Count => settings.extract_amount(),
+    };
+    let noun = if amount == 1 { "item" } else { "items" };
+    format!("{amount} {noun}")
+}
+
+/// A connector side's stack mode and stock count, as the readout adds them: the
+/// mode's name, and `keep` for an extractor's or `stock` for an inserter's count.
+fn stock_phrase(entry: &Entry) -> String {
+    let mut phrase = entry.settings.stack_mode().name().to_string();
+    if let Some(count) = entry.settings.count() {
+        let word = match entry.settings.mode() {
+            TransferMode::Extract => "keep",
+            TransferMode::Insert => "stock",
+        };
+        phrase.push_str(&format!(", {word} {count}"));
+    }
+    phrase
+}
+
+/// A connector side's settings as one readout line: side, mode, rate, priority,
+/// filter, and how much one operation carries.
 fn settings_line(entry: &Entry) -> String {
     let filter = match (
         entry.settings.filters().is_empty(),
@@ -385,14 +601,16 @@ fn settings_line(entry: &Entry) -> String {
         (false, true) => format!("not {}", entry.settings.filters().join(" ")),
     };
     format!(
-        "{},{},{} {} {}, {SINGLE_AMOUNT} item every {} ticks, priority {}, filter {filter}",
-        entry.connector[0],
-        entry.connector[1],
-        entry.connector[2],
-        FACE_NAMES[entry.side],
-        mode_word(entry.settings.mode()),
-        entry.settings.interval(),
-        entry.settings.priority(),
+        "{x},{y},{z} {side} {mode}, {amount} every {interval} ticks, priority {priority}, filter {filter}, {stock}",
+        x = entry.connector[0],
+        y = entry.connector[1],
+        z = entry.connector[2],
+        side = FACE_NAMES[entry.side],
+        mode = mode_word(entry.settings.mode()),
+        amount = amount_phrase(&entry.settings),
+        interval = entry.settings.interval(),
+        priority = entry.settings.priority(),
+        stock = stock_phrase(entry),
     )
 }
 
@@ -422,13 +640,41 @@ fn known_controllers(
     level: LevelRef,
     controllers: &Mutex<Controllers>,
 ) -> Vec<Pos> {
-    let seen = controllers
+    let mut guard = controllers
         .lock()
-        .expect("the controller list lock is held for one copy")
-        .known(level);
-    seen.into_iter()
-        .filter(|&pos| level.block(host, pos) == Some(keys.controller))
-        .collect()
+        .expect("the controller list lock is held for one vist");
+    // The readout is the one consumer of this index, so it is also where the index is cleaned:
+    // a position whose controller is gone is dropped instead of filtered again on every run,
+    // and the set stays at its cap (the review finding).
+    let live = |pos: Pos| level.block(&*host, pos) == Some(keys.controller);
+    guard.prune(level, live);
+    guard.known(level)
+}
+
+/// The refusal `/xnet info` answers a source that is too far away and not an operator.
+const INFO_DENIED: &str =
+    "XNet: too far away; stand within 6 blocks of the network or ask an operator";
+
+/// Whether the command's source may read a network at `pos`: the acting player needs reach or
+/// an operator's permission (the network is private: its positions and filters are the owner's
+/// build), and the console may read anywhere.
+fn diagnostics_allowed(host: &dyn ServerHost, pos: Pos) -> bool {
+    let Some(player) = host.players().acting_player() else {
+        return diagnostics_permitted(None, None);
+    };
+    let permission = player.permission_level(host);
+    let distance = player
+        .entity()
+        .distance_to_sqr(
+            host,
+            [
+                f64::from(pos[0]) + 0.5,
+                f64::from(pos[1]) + 0.5,
+                f64::from(pos[2]) + 0.5,
+            ],
+        )
+        .map(f64::sqrt);
+    diagnostics_permitted(permission, distance)
 }
 
 /// A controller's readout: its network, its channels and every connector side.
@@ -459,12 +705,13 @@ fn controller_info(host: &mut dyn ServerHost, keys: &Keys, level: LevelRef, pos:
         feedback(
             host,
             &format!(
-                "XNet controller at {},{},{}: channel {index} {}, {} connector(s)",
+                "XNet controller at {},{},{}: channel {index} {}, {} connector(s), {}",
                 pos[0],
                 pos[1],
                 pos[2],
                 channel.kind().name(),
-                channel.entries().len()
+                channel.entries().len(),
+                channel.mode().name()
             ),
         );
         for entry in channel.entries() {
@@ -550,8 +797,13 @@ pub(crate) fn register_commands(event: &mut RegisterCommandsEvent<'_>) {
         "xnet remove <pos:block_pos> <channel:integer> <connector:block_pos> <side:word>",
         "xnet speed <pos:block_pos> <channel:integer> <connector:block_pos> <side:word> <ticks:integer>",
         "xnet priority <pos:block_pos> <channel:integer> <connector:block_pos> <side:word> <priority:integer>",
-        "xnet filter <pos:block_pos> <channel:integer> <connector:block_pos> <side:word> <item:word>",
-        "xnet unfilter <pos:block_pos> <channel:integer> <connector:block_pos> <side:word> <item:word>",
+        "xnet stack <pos:block_pos> <channel:integer> <connector:block_pos> <side:word> <stack:word>",
+        "xnet amount <pos:block_pos> <channel:integer> <connector:block_pos> <side:word> <amount:integer>",
+        "xnet count <pos:block_pos> <channel:integer> <connector:block_pos> <side:word> <count:word>",
+        "xnet mode <pos:block_pos> <channel:integer> <mode:word>",
+        // The item is a `text` argument: an item id contains `:`, which a `word` argument ends at.
+        "xnet filter <pos:block_pos> <channel:integer> <connector:block_pos> <side:word> <item:text>",
+        "xnet unfilter <pos:block_pos> <channel:integer> <connector:block_pos> <side:word> <item:text>",
         "xnet blacklist <pos:block_pos> <channel:integer> <connector:block_pos> <side:word> <on:word>",
     ] {
         event.commands.push(Command::op(usage, 2));
@@ -631,6 +883,15 @@ fn edit_channel(
     Ok(updated)
 }
 
+/// Restart a channel's round-robin offset, as upstream's `update` does when the
+/// channel's settings change.
+fn reset_offset(controllers: &Mutex<Controllers>, level: LevelRef, pos: Pos, index: usize) {
+    controllers
+        .lock()
+        .expect("the round-robin lock is held for one write")
+        .remember_offset(level, pos, index, 0);
+}
+
 /// Run one `/xnet` command: the readout and the settings path that stands in for
 /// the controller screen.
 pub(crate) fn run_command(
@@ -652,6 +913,12 @@ pub(crate) fn run_command(
                 feedback(host, "Usage: /xnet info <x> <y> <z>");
                 return Flow::Cancel;
             };
+            // A network's positions and its filters are its owner's build, so the diagnostic is
+            // a nearby read or an operator's, not a remote probe (the review finding).
+            if !diagnostics_allowed(host, pos) {
+                feedback(host, INFO_DENIED);
+                return Flow::Cancel;
+            }
             let block = keys(host).zip(level.block(host, pos));
             match block {
                 Some((keys, block)) if block == keys.controller => {
@@ -694,10 +961,14 @@ pub(crate) fn run_command(
                 })
             });
             match edited {
-                Ok(_) => feedback(
-                    host,
-                    &format!("XNet: channel {index} is now {}", kind.name()),
-                ),
+                Ok(_) => {
+                    // A new kind is new settings, so the offset restarts with them.
+                    reset_offset(controllers, level, pos, index);
+                    feedback(
+                        host,
+                        &format!("XNet: channel {index} is now {}", kind.name()),
+                    )
+                }
                 Err(message) => feedback(host, message),
             }
             Flow::Cancel
@@ -831,6 +1102,177 @@ pub(crate) fn run_command(
                         connector[0], connector[1], connector[2], FACE_NAMES[side]
                     ),
                 ),
+                Err(message) => feedback(host, message),
+            }
+            Flow::Cancel
+        }
+        ["xnet", "stack"] => {
+            let Some((pos, index, connector, side)) = entry_args(command) else {
+                feedback(
+                    host,
+                    "Usage: /xnet stack <x> <y> <z> <channel> <cx> <cy> <cz> <side> <single|stack|count>",
+                );
+                return Flow::Cancel;
+            };
+            let Some(stack) = arg_word(command, "stack").and_then(StackMode::named) else {
+                feedback(host, "XNet: the stack mode is single, stack or count.");
+                return Flow::Cancel;
+            };
+            let edited = edit_channel(host, level, pos, index, |channel| {
+                let settings = channel
+                    .entry(connector, side)?
+                    .clone()
+                    .with_stack_mode(stack);
+                Some(channel.with_entry(Entry {
+                    connector,
+                    side,
+                    settings,
+                }))
+            });
+            match edited {
+                Ok(channel) => {
+                    let shown = channel
+                        .entry(connector, side)
+                        .map_or_else(String::new, amount_phrase);
+                    feedback(
+                        host,
+                        &format!(
+                            "XNet: {},{},{} {} moves {shown} per operation ({})",
+                            connector[0],
+                            connector[1],
+                            connector[2],
+                            FACE_NAMES[side],
+                            stack.name()
+                        ),
+                    );
+                }
+                Err(message) => feedback(host, message),
+            }
+            Flow::Cancel
+        }
+        ["xnet", "amount"] => {
+            let Some((pos, index, connector, side)) = entry_args(command) else {
+                feedback(
+                    host,
+                    "Usage: /xnet amount <x> <y> <z> <channel> <cx> <cy> <cz> <side> <amount>",
+                );
+                return Flow::Cancel;
+            };
+            let Some(amount) =
+                arg_int(command, "amount").and_then(|amount| u32::try_from(amount).ok())
+            else {
+                feedback(host, "XNet: the amount is 1 to 64 items.");
+                return Flow::Cancel;
+            };
+            let edited = edit_channel(host, level, pos, index, |channel| {
+                let settings = channel
+                    .entry(connector, side)?
+                    .clone()
+                    .with_extract_amount(amount);
+                Some(channel.with_entry(Entry {
+                    connector,
+                    side,
+                    settings,
+                }))
+            });
+            match edited {
+                Ok(channel) => {
+                    let shown = channel
+                        .entry(connector, side)
+                        .map_or(0, ItemSettings::extract_amount);
+                    feedback(
+                        host,
+                        &format!(
+                            "XNet: {},{},{} {} takes {shown} items per operation in count mode",
+                            connector[0], connector[1], connector[2], FACE_NAMES[side]
+                        ),
+                    );
+                }
+                Err(message) => feedback(host, message),
+            }
+            Flow::Cancel
+        }
+        ["xnet", "count"] => {
+            let Some((pos, index, connector, side)) = entry_args(command) else {
+                feedback(
+                    host,
+                    "Usage: /xnet count <x> <y> <z> <channel> <cx> <cy> <cz> <side> <count|->",
+                );
+                return Flow::Cancel;
+            };
+            let Some(word) = arg_word(command, "count") else {
+                feedback(host, "XNet: a whole number, or - to clear the count.");
+                return Flow::Cancel;
+            };
+            let count = match word {
+                "-" | "none" => None,
+                number => match number.parse::<u32>() {
+                    Ok(count) => Some(count),
+                    Err(_) => {
+                        feedback(host, "XNet: a whole number, or - to clear the count.");
+                        return Flow::Cancel;
+                    }
+                },
+            };
+            let edited = edit_channel(host, level, pos, index, |channel| {
+                let settings = channel.entry(connector, side)?.clone().with_count(count);
+                Some(channel.with_entry(Entry {
+                    connector,
+                    side,
+                    settings,
+                }))
+            });
+            match edited {
+                Ok(channel) => {
+                    let shown = channel
+                        .entry(connector, side)
+                        .and_then(ItemSettings::count)
+                        .map_or_else(
+                            || "has no count".to_string(),
+                            |count| format!("keeps {count}"),
+                        );
+                    feedback(
+                        host,
+                        &format!(
+                            "XNet: {},{},{} {} {shown}",
+                            connector[0], connector[1], connector[2], FACE_NAMES[side]
+                        ),
+                    );
+                }
+                Err(message) => feedback(host, message),
+            }
+            Flow::Cancel
+        }
+        ["xnet", "mode"] => {
+            let (Some(pos), Some(index)) = (arg_pos(command, "pos"), arg_int(command, "channel"))
+            else {
+                feedback(
+                    host,
+                    "Usage: /xnet mode <x> <y> <z> <channel> <priority|roundrobin>",
+                );
+                return Flow::Cancel;
+            };
+            let Ok(index) = usize::try_from(index) else {
+                feedback(host, "XNet: the channel is 0 to 7.");
+                return Flow::Cancel;
+            };
+            let Some(mode) = arg_word(command, "mode").and_then(ChannelMode::named) else {
+                feedback(host, "XNet: the channel mode is priority or roundrobin.");
+                return Flow::Cancel;
+            };
+            let edited = edit_channel(host, level, pos, index, |channel| {
+                Some(channel.with_mode(mode))
+            });
+            match edited {
+                Ok(_) => {
+                    // Upstream's `update` resets the offset when the channel's settings
+                    // change, so the next operation starts at the first destination.
+                    reset_offset(controllers, level, pos, index);
+                    feedback(
+                        host,
+                        &format!("XNet: channel {index} distributes by {}", mode.name()),
+                    );
+                }
                 Err(message) => feedback(host, message),
             }
             Flow::Cancel

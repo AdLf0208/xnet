@@ -71,7 +71,7 @@ impl Hooks for Mod {
                 .expect("the controller queue lock is held for one drain")
                 .take(event.level)
         };
-        network::run_controllers(host, event.level, queued);
+        network::run_controllers(host, event.level, queued, &self.controllers);
     }
 
     /// `/xnet info <pos>` for every player, and the operator commands that edit a

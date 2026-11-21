@@ -1,11 +1,12 @@
 id = "xnet"
 name = "XNet"
-version = "0.2.0"
+version = "0.2.2"
 description = """A port of XNet for Horizon: a controller owns eight channels, a channel holds
-connector/side entries whose settings say insert or extract, and the item channel hands one item
-per operation from the inventory behind an extractor to the inventory behind an inserter, highest
-priority first. The controller, the cable, the connector, their assets and the channel logic are
-one package, so a single .hmod installs both halves."""
+connector/side entries whose settings say insert or extract, and the item channel hands items from
+the inventory behind an extractor to the inventories behind its inserters — one item, a whole stack
+or a counted amount per operation, highest priority first or round robin, with a stock-keeping count
+on either end. The controller, the cable, the connector, their assets and the channel logic are one
+package, so a single .hmod installs both halves."""
 authors = ["McJty", "AdLf0208"]
 # A native mod: Rust in src/, compiled by the launcher against the game build [native] pins,
 # beside data/ and assets/. The id is the resource namespace and the only identity: Cargo's
@@ -21,5 +22,5 @@ capabilities = ["registries"]
 
 [native]
 game = "26.3"
-horizon = "0b14f8acfd97fa2c750e42795249dcc981178ca4"
+horizon = "0a875da91dbb0fdcb7ba8c42c11341aa229af51a"
 mixins = "e59da9094f0c2fdda6c627fe9eff22dec6a906f0"
